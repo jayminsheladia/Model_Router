@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Model Router</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Model Router</h1>
+    <p class="tagline">Policy-aware LLM routing &mdash; who's asking, what they're allowed to spend, and why every decision happened.</p>
+  </header>
+
+  <main>
+    <section class="panel" id="route-panel">
+      <h2>Route a request</h2>
+      <form id="route-form">
+        <label>
+          User
+          <select id="user-select" required></select>
+        </label>
+        <label>
+          Project <span class="hint">(required for restricted users)</span>
+          <input type="text" id="project-input" placeholder="e.g. internal-tools" />
+          <span class="hint" id="restricted-projects-hint"></span>
+        </label>
+        <label>
+          Prompt
+          <textarea id="prompt-input" rows="4" required placeholder="e.g. refactor this function to be async"></textarea>
+        </label>
+        <button type="submit">Route request</button>
+      </form>
+
+      <div id="result" class="result hidden"></div>
+    </section>
+
+    <section class="panel" id="budgets-panel">
+      <h2>Budgets</h2>
+      <div id="budgets-list"></div>
+    </section>
+
+    <section class="panel wide" id="audit-panel">
+      <div class="panel-header">
+        <h2>Audit trail</h2>
+        <button id="refresh-audit" class="secondary">Refresh</button>
+      </div>
+      <div class="table-scroll">
+        <table id="audit-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>User</th>
+              <th>Project</th>
+              <th>Complexity &rarr; Tier</th>
+              <th>Outcome</th>
+              <th>Reason</th>
+              <th>Cost</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

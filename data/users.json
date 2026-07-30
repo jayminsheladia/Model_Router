@@ -1,0 +1,25 @@
+{
+  "alice": {
+    "team": "platform",
+    "monthly_budget_usd": 50.0,
+    "max_tier": "frontier",
+    "allowed_projects": [],
+    "project_tier_overrides": {}
+  },
+  "bob": {
+    "team": "support",
+    "monthly_budget_usd": 1.0,
+    "max_tier": "mid",
+    "allowed_projects": [],
+    "project_tier_overrides": {}
+  },
+  "carol": {
+    "team": "platform",
+    "monthly_budget_usd": 20.0,
+    "max_tier": "mid",
+    "allowed_projects": ["internal-tools", "growth-experiments"],
+    "project_tier_overrides": {
+      "internal-tools": "frontier"
+    }
+  }
+}
