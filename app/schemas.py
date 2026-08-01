@@ -17,6 +17,7 @@ class RouteRequest(BaseModel):
     user_id: str
     prompt: str
     project: Optional[str] = None
+    routing_mode: Literal["quality", "cost", "balanced"] = "balanced"
 
 
 class ClassifierOutput(BaseModel):

@@ -6,7 +6,8 @@ from app.audit import AuditLogger
 from app.budget import BudgetLedger
 from app.feedback import FeedbackStore
 from app.identity import IdentityRegistry
-from app.models.mock_client import MockModelClient
+from app.llm_classifier import LLMClassifier
+from app.models.mock_client import MockModelClient, ModelUnavailableError
 from app.projects import ProjectRegistry
 from app.router import (
     AuditNotFoundError,
@@ -30,6 +31,9 @@ def orchestrator(tmp_path: Path) -> RouteOrchestrator:
         audit=AuditLogger(db_path=db_path),
         feedback=FeedbackStore(db_path=db_path),
         project_registry=ProjectRegistry(db_path=db_path),
+        # Force-disabled regardless of the host shell's env, so tests never make a
+        # real network call even if ANTHROPIC_API_KEY happens to be set locally.
+        llm_classifier=LLMClassifier(api_key=None),
     )
 
 
@@ -166,3 +170,73 @@ def test_unregistered_project_is_open(orchestrator: RouteOrchestrator):
         RouteRequest(user_id="alice", prompt="fix a bug", project="some-brand-new-project")
     )
     assert response.allowed is True
+
+
+def test_routing_mode_cost_downgrades_below_balanced(orchestrator: RouteOrchestrator):
+    balanced = orchestrator.route(
+        RouteRequest(user_id="alice", prompt=HIGH_COMPLEXITY_PROMPT, routing_mode="balanced")
+    )
+    cost = orchestrator.route(
+        RouteRequest(user_id="alice", prompt=HIGH_COMPLEXITY_PROMPT, routing_mode="cost")
+    )
+    assert balanced.final_tier == Tier.FRONTIER
+    assert cost.final_tier == Tier.MID  # cost mode pre-emptively steps down one tier
+    assert "cost mode" in cost.reason.lower()
+
+
+def test_routing_mode_quality_ignores_soft_budget_downgrade(orchestrator: RouteOrchestrator):
+    user = orchestrator.identity.get_user("bob")
+    orchestrator.budget.record(user, 0.9)  # over bob's 80% soft limit
+
+    balanced = orchestrator.route(
+        RouteRequest(user_id="bob", prompt=HIGH_COMPLEXITY_PROMPT, routing_mode="balanced")
+    )
+    quality = orchestrator.route(
+        RouteRequest(user_id="bob", prompt=HIGH_COMPLEXITY_PROMPT, routing_mode="quality")
+    )
+    assert balanced.final_tier == Tier.CHEAP  # downgraded from the usual mid cap
+    assert quality.final_tier == Tier.MID  # quality mode ignores the soft-limit downgrade
+    assert "quality mode" in quality.reason.lower()
+
+
+def test_failover_steps_down_to_next_tier(tmp_path: Path):
+    db_path = tmp_path / "router.db"
+    orchestrator = RouteOrchestrator(
+        identity=IdentityRegistry(db_path=db_path),
+        budget=BudgetLedger(db_path=db_path),
+        model_client=MockModelClient(force_fail_tiers=frozenset({Tier.FRONTIER})),
+        audit=AuditLogger(db_path=db_path),
+        feedback=FeedbackStore(db_path=db_path),
+        project_registry=ProjectRegistry(db_path=db_path),
+        llm_classifier=LLMClassifier(api_key=None),
+    )
+    response = orchestrator.route(RouteRequest(user_id="alice", prompt=HIGH_COMPLEXITY_PROMPT))
+    assert response.allowed is True
+    assert response.final_tier == Tier.MID
+    assert "failover" in response.reason.lower()
+    assert "frontier" in response.reason.lower()
+
+
+def test_simulate_outage_marker_triggers_failover(orchestrator: RouteOrchestrator):
+    prompt = HIGH_COMPLEXITY_PROMPT + " [[simulate-outage:frontier]]"
+    response = orchestrator.route(RouteRequest(user_id="alice", prompt=prompt))
+    assert response.allowed is True
+    assert response.final_tier == Tier.MID
+    assert "failover" in response.reason.lower()
+
+
+def test_mock_client_raises_for_forced_tier():
+    client = MockModelClient(force_fail_tiers=frozenset({Tier.CHEAP}))
+    with pytest.raises(ModelUnavailableError):
+        client.call(Tier.CHEAP, "hello")
+
+
+def test_llm_classifier_disabled_is_a_noop():
+    from app.classifier import classify
+
+    heuristic = classify(MEDIUM_COMPLEXITY_PROMPT)
+    llm = LLMClassifier(api_key=None)
+    assert llm.enabled is False
+
+    result = llm.reclassify_if_ambiguous(MEDIUM_COMPLEXITY_PROMPT, heuristic)
+    assert result == heuristic

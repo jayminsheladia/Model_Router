@@ -1,5 +1,24 @@
+const themeToggle = document.getElementById("theme-toggle");
+
+function preferredTheme() {
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  localStorage.setItem("theme", theme);
+}
+
+applyTheme(localStorage.getItem("theme") || preferredTheme());
+
+themeToggle.addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme");
+  applyTheme(current === "dark" ? "light" : "dark");
+});
+
 const userSelect = document.getElementById("user-select");
 const projectInput = document.getElementById("project-input");
+const routingModeSelect = document.getElementById("routing-mode-select");
 const promptInput = document.getElementById("prompt-input");
 const routeForm = document.getElementById("route-form");
 const resultEl = document.getElementById("result");
@@ -106,7 +125,7 @@ function renderResult(response) {
   resultEl.innerHTML = `
     <div class="result-row">
       <span class="badge ${badgeClass}">${badgeText}</span>
-      <span class="label" style="margin-left:0.5rem">audit_id ${response.audit_id}</span>
+      <span class="audit-tag">audit_id ${response.audit_id}</span>
     </div>
     ${tierRow}
     ${costRow}
@@ -153,6 +172,7 @@ routeForm.addEventListener("submit", async (event) => {
         user_id: userSelect.value,
         prompt: promptInput.value,
         project: projectInput.value || null,
+        routing_mode: routingModeSelect.value,
       }),
     });
     renderResult(response);

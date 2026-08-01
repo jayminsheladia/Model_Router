@@ -8,6 +8,7 @@ def make_client(tmp_path, monkeypatch):
     from app.budget import BudgetLedger
     from app.feedback import FeedbackStore
     from app.identity import IdentityRegistry
+    from app.llm_classifier import LLMClassifier
     from app.models.mock_client import MockModelClient
     from app.projects import ProjectRegistry
     from app.router import RouteOrchestrator
@@ -20,6 +21,7 @@ def make_client(tmp_path, monkeypatch):
         audit=AuditLogger(db_path=db_path),
         feedback=FeedbackStore(db_path=db_path),
         project_registry=ProjectRegistry(db_path=db_path),
+        llm_classifier=LLMClassifier(api_key=None),
     )
     monkeypatch.setattr(main_module, "orchestrator", orchestrator)
     return TestClient(main_module.app)

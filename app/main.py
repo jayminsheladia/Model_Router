@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
@@ -16,8 +17,17 @@ from app.schemas import (
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+load_dotenv()
+
 app = FastAPI(title="Policy-Aware Model Router")
 orchestrator = RouteOrchestrator()
+
+
+@app.middleware("http")
+async def no_cache(request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, must-revalidate"
+    return response
 
 
 @app.post("/route", response_model=RouteResponse)

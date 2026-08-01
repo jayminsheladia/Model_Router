@@ -5,3 +5,4 @@ venv/
 .pytest_cache/
 data/router.db
 .DS_Store
+.env

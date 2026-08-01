@@ -11,6 +11,7 @@ def decide(
     classifier_output: ClassifierOutput,
     budget_state: BudgetState,
     project_registry: ProjectRegistry,
+    routing_mode: str = "balanced",
 ) -> PolicyDecision:
     if classifier_output.off_policy:
         return PolicyDecision(
@@ -57,6 +58,14 @@ def decide(
 
     tier = classifier_output.suggested_tier
 
+    if routing_mode == "cost":
+        tier_idx = TIER_ORDER.index(tier)
+        if tier_idx > 0:
+            tier = TIER_ORDER[tier_idx - 1]
+        cost_mode_reason = " Cost mode: pre-emptively downgraded one tier."
+    else:
+        cost_mode_reason = ""
+
     max_tier = user.project_tier_overrides.get(project, user.max_tier) if project else user.max_tier
     max_tier_idx = TIER_ORDER.index(max_tier)
     if TIER_ORDER.index(tier) > max_tier_idx:
@@ -67,7 +76,7 @@ def decide(
     else:
         capped_reason = ""
 
-    if budget_state.over_soft_limit:
+    if budget_state.over_soft_limit and routing_mode != "quality":
         tier_idx = TIER_ORDER.index(tier)
         if tier_idx > 0:
             tier = TIER_ORDER[tier_idx - 1]
@@ -75,9 +84,16 @@ def decide(
             f" Downgraded one tier: over soft budget limit "
             f"(${budget_state.spent_usd:.2f} / ${budget_state.limit_usd:.2f})."
         )
+    elif budget_state.over_soft_limit and routing_mode == "quality":
+        downgrade_reason = " Quality mode: ignoring soft-budget downgrade."
     else:
         downgrade_reason = ""
 
-    reason = f"Allowed at {tier} tier ({classifier_output.reasoning})" + capped_reason + downgrade_reason
+    reason = (
+        f"Allowed at {tier} tier ({classifier_output.reasoning})"
+        + cost_mode_reason
+        + capped_reason
+        + downgrade_reason
+    )
 
     return PolicyDecision(allowed=True, final_tier=tier, reason=reason)
