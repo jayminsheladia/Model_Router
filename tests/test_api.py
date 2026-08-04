@@ -6,6 +6,7 @@ import app.main as main_module
 def make_client(tmp_path, monkeypatch):
     from app.audit import AuditLogger
     from app.budget import BudgetLedger
+    from app.conversations import ConversationStore
     from app.feedback import FeedbackStore
     from app.identity import IdentityRegistry
     from app.llm_classifier import LLMClassifier
@@ -22,6 +23,7 @@ def make_client(tmp_path, monkeypatch):
         feedback=FeedbackStore(db_path=db_path),
         project_registry=ProjectRegistry(db_path=db_path),
         llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
     )
     monkeypatch.setattr(main_module, "orchestrator", orchestrator)
     return TestClient(main_module.app)

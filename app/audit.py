@@ -20,13 +20,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
     reason TEXT NOT NULL,
     cost_usd REAL NOT NULL,
     latency_ms REAL NOT NULL,
-    budget_json TEXT NOT NULL
+    budget_json TEXT NOT NULL,
+    conversation_id TEXT
 )
 """
 
 COLUMNS = [
     "id", "timestamp", "user_id", "project", "prompt_snippet", "classifier_json",
     "allowed", "final_tier", "reason", "cost_usd", "latency_ms", "budget_json",
+    "conversation_id",
 ]
 
 
@@ -41,8 +43,9 @@ class AuditLogger:
         with sqlite3.connect(self._db_path) as conn:
             cursor = conn.execute(
                 "INSERT INTO audit_log (timestamp, user_id, project, prompt_snippet, "
-                "classifier_json, allowed, final_tier, reason, cost_usd, latency_ms, budget_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "classifier_json, allowed, final_tier, reason, cost_usd, latency_ms, budget_json, "
+                "conversation_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     now_iso(),
                     entry["user_id"],
@@ -55,6 +58,7 @@ class AuditLogger:
                     entry["cost_usd"],
                     entry["latency_ms"],
                     json.dumps(entry["budget"]),
+                    entry.get("conversation_id"),
                 ),
             )
             return cursor.lastrowid

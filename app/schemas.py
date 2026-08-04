@@ -18,6 +18,7 @@ class RouteRequest(BaseModel):
     prompt: str
     project: Optional[str] = None
     routing_mode: Literal["quality", "cost", "balanced"] = "balanced"
+    conversation_id: Optional[str] = None
 
 
 class ClassifierOutput(BaseModel):
@@ -52,6 +53,7 @@ class RouteResponse(BaseModel):
     reason: str
     classifier: ClassifierOutput
     budget: BudgetState
+    conversation_id: Optional[str] = None
 
 
 class FeedbackRequest(BaseModel):

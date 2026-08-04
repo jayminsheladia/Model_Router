@@ -54,9 +54,14 @@
           <textarea id="prompt-input" rows="4" required placeholder="e.g. refactor this function to be async"></textarea>
           <span class="hint">Tip: include [[simulate-outage:frontier]] (or mid/cheap) in the prompt to test automatic failover.</span>
         </label>
+        <label class="checkbox-row" id="continue-conversation-row" hidden>
+          <input type="checkbox" id="continue-conversation-checkbox" checked />
+          <span id="continue-conversation-label">Continue this conversation</span>
+        </label>
         <button type="submit">Route request</button>
       </form>
 
+      <div id="conversation-thread" class="conversation-thread hidden"></div>
       <div id="result" class="result hidden"></div>
     </section>
 

@@ -25,8 +25,72 @@ const resultEl = document.getElementById("result");
 const budgetsList = document.getElementById("budgets-list");
 const auditBody = document.querySelector("#audit-table tbody");
 const refreshAuditBtn = document.getElementById("refresh-audit");
+const continueRow = document.getElementById("continue-conversation-row");
+const continueCheckbox = document.getElementById("continue-conversation-checkbox");
+const continueLabel = document.getElementById("continue-conversation-label");
+const conversationThreadEl = document.getElementById("conversation-thread");
 
 let usersCache = [];
+let conversation = { id: null, userId: null, turns: [] };
+
+function resetConversation() {
+  conversation = { id: null, userId: null, turns: [] };
+  continueRow.hidden = true;
+  conversationThreadEl.classList.add("hidden");
+  conversationThreadEl.innerHTML = "";
+}
+
+function renderConversationControls() {
+  if (!conversation.id) {
+    continueRow.hidden = true;
+    return;
+  }
+  continueRow.hidden = false;
+  continueLabel.textContent = `Continue this conversation (turn ${conversation.turns.length + 1})`;
+}
+
+function renderConversationThread() {
+  // The most recent turn is already shown in full detail in #result below --
+  // the thread here shows the turns *before* that one, compactly.
+  const priorTurns = conversation.turns.slice(0, -1);
+  if (priorTurns.length === 0) {
+    conversationThreadEl.classList.add("hidden");
+    conversationThreadEl.innerHTML = "";
+    return;
+  }
+  conversationThreadEl.classList.remove("hidden");
+  conversationThreadEl.innerHTML =
+    '<div class="conversation-thread-label">Earlier in this conversation</div>' +
+    priorTurns
+      .map(
+        (turn) => `
+      <div class="thread-turn">
+        <div class="thread-you"><strong>You:</strong> ${escapeHtml(turn.prompt)}</div>
+        <div class="thread-router"><span class="thread-tier">${turn.tier}</span>${escapeHtml(turn.output)}</div>
+      </div>
+    `
+      )
+      .join("");
+}
+
+userSelect.addEventListener("change", () => {
+  if (conversation.id && conversation.userId !== userSelect.value) {
+    resetConversation();
+  }
+});
+
+function formatCost(costUsd) {
+  // Real per-token costs can be tiny (e.g. $0.000006) -- toFixed(4) would round
+  // those to $0.0000, so scale precision to the magnitude instead.
+  if (costUsd > 0 && costUsd < 0.01) return costUsd.toFixed(6);
+  return costUsd.toFixed(4);
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
 
 async function fetchJSON(url, options) {
   const res = await fetch(url, options);
@@ -51,15 +115,19 @@ function renderBudgets(users) {
     return;
   }
   for (const user of users) {
-    const pct = Math.min(100, (user.budget.spent_usd / user.budget.limit_usd) * 100);
+    const rawPct = Math.min(100, (user.budget.spent_usd / user.budget.limit_usd) * 100);
+    // Real per-request costs can be a tiny fraction of a large budget (e.g. $0.0001 of $50 --
+    // ~0.0002%), which renders as a 0px bar even though real money was spent. Give any nonzero
+    // spend a visible sliver so the bar doesn't look frozen at zero.
+    const visualPct = user.budget.spent_usd > 0 ? Math.max(rawPct, 1) : 0;
     const item = document.createElement("div");
     item.className = "budget-item";
     item.innerHTML = `
       <div class="budget-item-head">
         <span><strong>${user.user_id}</strong> <span class="muted">(${user.team}, max ${user.max_tier})</span></span>
-        <span class="muted">$${user.budget.spent_usd.toFixed(2)} / $${user.budget.limit_usd.toFixed(2)}</span>
+        <span class="muted">$${formatCost(user.budget.spent_usd)} / $${user.budget.limit_usd.toFixed(2)}</span>
       </div>
-      <div class="budget-bar"><div class="budget-bar-fill ${budgetBarClass(user.budget)}" style="width:${pct}%"></div></div>
+      <div class="budget-bar"><div class="budget-bar-fill ${budgetBarClass(user.budget)}" style="width:${visualPct}%"></div></div>
     `;
     budgetsList.appendChild(item);
   }
@@ -111,7 +179,12 @@ function renderResult(response) {
     : "";
 
   const costRow = response.allowed
-    ? `<div class="result-row"><span class="label">Cost:</span>$${response.cost_usd.toFixed(4)} &nbsp; <span class="label">Latency:</span>${response.latency_ms.toFixed(0)}ms</div>`
+    ? `<div class="result-row"><span class="label">Cost:</span>$${formatCost(response.cost_usd)} &nbsp; <span class="label">Latency:</span>${response.latency_ms.toFixed(0)}ms</div>`
+    : "";
+
+  const outputRow = response.allowed && response.output_text
+    ? `<div class="result-row"><span class="label">Model output:</span></div>
+       <div class="model-output">${escapeHtml(response.output_text)}</div>`
     : "";
 
   const feedbackRow = response.allowed
@@ -131,6 +204,7 @@ function renderResult(response) {
     ${costRow}
     <div class="result-row"><span class="label">Classifier:</span>${response.classifier.complexity} complexity &rarr; suggested ${response.classifier.suggested_tier}</div>
     <div class="reasoning">${response.reason}</div>
+    ${outputRow}
     ${feedbackRow}
   `;
 
@@ -164,18 +238,33 @@ routeForm.addEventListener("submit", async (event) => {
   const submitBtn = routeForm.querySelector("button[type=submit]");
   submitBtn.disabled = true;
   resultEl.classList.add("hidden");
+  const continuePrevious = conversation.id && continueCheckbox.checked;
+  const promptSent = promptInput.value;
   try {
     const response = await fetchJSON("/route", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         user_id: userSelect.value,
-        prompt: promptInput.value,
+        prompt: promptSent,
         project: projectInput.value || null,
         routing_mode: routingModeSelect.value,
+        conversation_id: continuePrevious ? conversation.id : null,
       }),
     });
     renderResult(response);
+    if (response.conversation_id) {
+      if (response.conversation_id !== conversation.id) {
+        conversation = { id: response.conversation_id, userId: userSelect.value, turns: [] };
+      }
+      conversation.turns.push({
+        prompt: promptSent,
+        tier: response.final_tier,
+        output: response.output_text || "",
+      });
+    }
+    renderConversationControls();
+    renderConversationThread();
     loadAudit();
     loadUsers();
   } catch (err) {
@@ -206,7 +295,7 @@ function renderAudit(entries) {
       <td>${tierPath}</td>
       <td>${outcome}</td>
       <td class="reason-cell" title="${entry.reason}">${entry.reason}</td>
-      <td>$${entry.cost_usd.toFixed(4)}</td>
+      <td>$${formatCost(entry.cost_usd)}</td>
     `;
     auditBody.appendChild(tr);
   }

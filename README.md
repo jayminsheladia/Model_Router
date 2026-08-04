@@ -22,26 +22,31 @@ All six components from the original design are implemented:
 Two things borrowed from studying Azure Foundry's and AnythingLLM's model
 routers round this out: a **routing-mode dial** (Quality/Cost/Balanced, `app/policy.py`)
 and **automatic failover** (`app/router.py` steps down a tier if the chosen
-one is "unavailable," simulated via `app/models/mock_client.py`).
+one is "unavailable" — a simulated marker, or a real transient error).
 
-The model backend itself (`app/models/mock_client.py`) is still simulated —
-real LiteLLM/provider wiring for the *serving* path is the next step, see
-"Follow-ups" below. The *classification* path already makes a real Claude
-call for ambiguous prompts, see "Real LLM classification" below.
+The model backend is real when a `GROQ_API_KEY` is set: `cheap`/`mid`/`frontier`
+map to three actual Groq-hosted models with real cost, latency, and generated
+output (see "Real model serving" below), falling back to a simulated backend
+(`app/models/mock_client.py`) otherwise. The *classification* path separately
+makes a real Claude call for ambiguous prompts, see "Real LLM classification"
+below — the two are independent and can be enabled separately.
 
 ## How a request flows
 
 ```
-POST /route {user_id, prompt, project?, routing_mode?}
+POST /route {user_id, prompt, project?, routing_mode?, conversation_id?}
   -> identity lookup       (team, budget, max tier, allowed projects, per-project tier overrides)
+  -> conversation lookup    (if conversation_id given: prior turns for this user, or blocked if the
+                             conversation belongs to someone else -- see "Conversation memory" below)
   -> classifier              (heuristic complexity scorer, biased by past /feedback signals;
                               genuinely ambiguous prompts get a real Claude Haiku call, see below)
   -> budget check              (spent vs. monthly limit -> soft/hard limit flags)
   -> policy engine                (off-policy? hard limit? user allowed on this project? project itself
                                    restricted to other users? tier cap/override? cost/quality routing
                                    mode adjustment? soft-limit downgrade?)
-  -> mock model call                 (simulated cost/latency per tier; steps down a tier and retries
-                                      if the chosen one is "unavailable" -- automatic failover)
+  -> model call                      (real Groq call if GROQ_API_KEY is set, else simulated; steps
+                                      down a tier and retries if the chosen one is "unavailable" --
+                                      automatic failover, real or simulated)
   -> budget ledger update
   -> audit log                          (SQLite row: full decision trace, returns an audit_id)
 
@@ -110,10 +115,46 @@ apply identically in every mode:
 
 If the tier a request was routed to is "unavailable," the router transparently retries at the next
 tier down (frontier → mid → cheap) rather than failing the request, and the response's `final_tier`
-and `reason` reflect what actually served it. Since the mock backend doesn't have real outages, you
-can trigger one two ways: pass `[[simulate-outage:<tier>]]` (e.g. `[[simulate-outage:frontier]]`)
-anywhere in the prompt text (works from the dashboard too — no restart needed), or construct
-`MockModelClient(force_fail_tiers={...})` directly in code/tests.
+and `reason` reflect what actually served it. In simulated mode there's no such thing as a real
+outage, so you trigger one on demand: pass `[[simulate-outage:<tier>]]` (e.g.
+`[[simulate-outage:frontier]]`) anywhere in the prompt text (works from the dashboard too — no
+restart needed), or construct `MockModelClient(force_fail_tiers={...})` directly in code/tests. In
+real (Groq) mode, the same marker still works (checked before any network call), *and* genuine
+transient errors (rate limits, timeouts, 5xx) trigger the same failover path automatically — see
+"Real model serving" below.
+
+### Real model serving (Groq)
+
+By default the `cheap`/`mid`/`frontier` tiers are simulated (`app/models/mock_client.py`) —
+fake cost, fake latency, canned output text. Set `GROQ_API_KEY` and `RouteOrchestrator` switches
+to `app/models/groq_client.py` automatically, which maps the three tiers to three real
+Groq-hosted models with real per-token pricing:
+
+| Tier | Model | Input / Output $ per 1M tokens |
+|---|---|---|
+| cheap | `llama-3.1-8b-instant` | $0.05 / $0.08 |
+| mid | `openai/gpt-oss-20b` | $0.075 / $0.30 |
+| frontier | `openai/gpt-oss-120b` | $0.15 / $0.60 (Groq's own flagship) |
+
+```bash
+cp .env.example .env
+# edit .env and set GROQ_API_KEY=gsk_... (get one at console.groq.com)
+```
+
+`output_text`, `cost_usd`, and `latency_ms` in the response are then genuine — real generated
+text, real token usage from the API response, real wall-clock latency. `model_name` reports the
+exact model that served the request (previously always said `"MockModelClient"`).
+
+Automatic failover (above) now does double duty: `GroqModelClient` converts any `groq.APIError`
+(rate limit, timeout, connection error, 5xx) into the same `ModelUnavailableError` the mock
+backend raises, so a real transient failure steps down a tier exactly like the simulated
+`[[simulate-outage:<tier>]]` marker does — which still works in real mode too (checked before
+any network call, and stripped from the prompt actually sent to Groq).
+
+Without a key, everything falls back to the simulated backend exactly as before — this is also
+what the test suite runs under, so tests never make a real network call (they either construct
+`MockModelClient` explicitly, or a `groq.APIError` is injected via `monkeypatch` to test the
+failover-mapping logic without touching the network).
 
 ### Real LLM classification
 
@@ -131,6 +172,46 @@ Without a key, `LLMClassifier` is a no-op (`enabled = False`) and the router run
 alone — this is also what the test suite runs under, so tests never make a real network call, even if
 your shell happens to have `ANTHROPIC_API_KEY` exported for something else (the test fixtures
 construct `LLMClassifier(api_key=None)` explicitly to guarantee this).
+
+### Conversation memory
+
+By default every `POST /route` call is stateless — a follow-up like "now make that async" gets
+answered with zero knowledge of what "that" refers to, because each call is a genuinely
+independent, context-free request. Passing `conversation_id` fixes this: prior turns get threaded
+into the model call as real chat history.
+
+- **First call**: omit `conversation_id` (or pass `null`). If allowed, the response includes a
+  freshly minted `conversation_id` — save it to continue the thread.
+- **Follow-up calls**: pass that same `conversation_id` back. The prior turns (your prompts + the
+  model's real replies) get prepended to the model call, so follow-ups actually work.
+- **Each turn is still independently policy-checked** — its own classification, budget check,
+  tier decision, and audit row. A conversation is shared *message history for the model call*, not
+  a single policy unit, so tier can legitimately change turn to turn (turn 1 might be `cheap`,
+  turn 3 `frontier`, if the questions warrant it).
+- **Conversations are scoped to the user who started them.** Passing someone else's
+  `conversation_id` doesn't leak their history — it's blocked with a clear reason
+  (`ConversationAccessError` in `app/conversations.py`), the same way an off-policy prompt or an
+  unauthorized project is blocked. This is deliberate: a policy-aware router shouldn't have a
+  cross-user data leak sitting in its one stateful feature.
+- Blocked turns are never appended to conversation history — there's no real completion to
+  represent, so nothing gets threaded into the *next* turn's model call.
+
+The dashboard surfaces this as a "Continue this conversation" checkbox (checked by default once a
+conversation exists) and renders the growing thread above the latest turn's full detail.
+
+```bash
+first=$(curl -s -X POST localhost:8000/route -H 'content-type: application/json' \
+  -d '{"user_id": "alice", "prompt": "remember the number 42"}')
+cid=$(echo "$first" | python3 -c "import json,sys; print(json.load(sys.stdin)['conversation_id'])")
+
+curl -X POST localhost:8000/route -H 'content-type: application/json' \
+  -d "{\"user_id\": \"alice\", \"prompt\": \"what number did I just tell you?\", \"conversation_id\": \"$cid\"}"
+  # -> real Groq response correctly references 42
+
+# bob trying to continue alice's conversation -> blocked, not leaked
+curl -X POST localhost:8000/route -H 'content-type: application/json' \
+  -d "{\"user_id\": \"bob\", \"prompt\": \"what did alice say?\", \"conversation_id\": \"$cid\"}"
+```
 
 Try it:
 
@@ -169,6 +250,10 @@ curl -X POST localhost:8000/route -H 'content-type: application/json' \
 # Automatic failover: force the frontier tier "unavailable" for this request
 curl -X POST localhost:8000/route -H 'content-type: application/json' \
   -d '{"user_id": "alice", "prompt": "design the architecture for a migration [[simulate-outage:frontier]]"}'  # served at mid, reason explains the failover
+
+# With GROQ_API_KEY set: output_text/cost_usd/latency_ms/model_name are all real
+curl -X POST localhost:8000/route -H 'content-type: application/json' \
+  -d '{"user_id": "alice", "prompt": "explain what a race condition is in one sentence"}'
 
 # bob has a $1.00 budget -- repeat a few times to see downgrade, then block
 curl -X POST localhost:8000/route -H 'content-type: application/json' \
@@ -212,22 +297,30 @@ app/
                                    per-project authorization > tier cap/override > routing-mode
                                    adjustment > soft-limit downgrade
   feedback.py                       Escalate/downgrade signal store, keyed by complexity bucket
-  router.py                           Orchestrator wiring the full request + feedback + failover flow
-  audit.py                              SQLite audit log, returns an id per decision
-  models/mock_client.py                   Simulated model tiers (cheap/mid/frontier), simulated outages
+  conversations.py                    Per-user-scoped conversation history (SQLite), for multi-turn threading
+  router.py                             Orchestrator wiring the full request + feedback + failover + conversation flow
+  audit.py                                SQLite audit log, returns an id per decision
+  models/
+    mock_client.py                        Simulated model tiers (cheap/mid/frontier), simulated outages
+    groq_client.py                        Real Groq-backed tiers; enabled automatically if GROQ_API_KEY is set
 data/
   users.json                                Human-editable seed data for demo users
   projects.json                               Human-editable seed data for restricted projects
   router.db                                     Created at runtime (gitignored)
-.env.example                                      Copy to .env to enable real LLM classification
+.env.example                                      Copy to .env to enable real model serving + classification
 ```
 
 ## Follow-ups
 
-- Swap `mock_client.py` for [LiteLLM](https://github.com/BerriAI/litellm) + real provider keys
-  for the *serving* path (classification already makes a real call, see above).
+- **Not RAG.** Conversation memory (above) threads *prior turns of the same conversation* into the
+  model call. It does not retrieve from any external knowledge base/document store — there's no
+  vector index or retrieval step anywhere in this project. That would be a separate, orthogonal
+  system sitting upstream of the router, not a natural extension of it.
+- Add more providers (OpenAI, Anthropic, etc.) behind the same `call()` interface as
+  `groq_client.py`, so tiers can mix providers instead of being Groq-only — [LiteLLM](https://github.com/BerriAI/litellm)
+  is the natural way to do this without hand-rolling a client per provider.
 - Benchmark routing accuracy against an oracle on a SWE-bench-lite style eval set, now that
-  there's a real classifier call to benchmark against.
+  both the classifier and the serving path make real calls to benchmark against.
 - Feedback loop currently biases at the complexity-bucket level; a richer
   version could key off matched keywords, per-user history, or a learned
   embedding similarity instead.

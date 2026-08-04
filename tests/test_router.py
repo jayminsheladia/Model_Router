@@ -4,6 +4,7 @@ import pytest
 
 from app.audit import AuditLogger
 from app.budget import BudgetLedger
+from app.conversations import ConversationAccessError, ConversationStore
 from app.feedback import FeedbackStore
 from app.identity import IdentityRegistry
 from app.llm_classifier import LLMClassifier
@@ -34,6 +35,7 @@ def orchestrator(tmp_path: Path) -> RouteOrchestrator:
         # Force-disabled regardless of the host shell's env, so tests never make a
         # real network call even if ANTHROPIC_API_KEY happens to be set locally.
         llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
     )
 
 
@@ -209,6 +211,7 @@ def test_failover_steps_down_to_next_tier(tmp_path: Path):
         feedback=FeedbackStore(db_path=db_path),
         project_registry=ProjectRegistry(db_path=db_path),
         llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
     )
     response = orchestrator.route(RouteRequest(user_id="alice", prompt=HIGH_COMPLEXITY_PROMPT))
     assert response.allowed is True
@@ -240,3 +243,142 @@ def test_llm_classifier_disabled_is_a_noop():
 
     result = llm.reclassify_if_ambiguous(MEDIUM_COMPLEXITY_PROMPT, heuristic)
     assert result == heuristic
+
+
+def test_groq_client_disabled_without_key(monkeypatch):
+    from app.models.groq_client import GroqModelClient
+
+    # Other test modules import app.main, whose module-level load_dotenv() call
+    # can leak a real GROQ_API_KEY from .env into this process's environment --
+    # force it unset so this test reflects "no key provided" regardless of
+    # what already ran earlier in the same pytest session.
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+
+    client = GroqModelClient(api_key=None)
+    assert client.enabled is False
+
+
+def test_orchestrator_falls_back_to_mock_when_groq_key_unset(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    db_path = tmp_path / "router.db"
+    orchestrator = RouteOrchestrator(
+        identity=IdentityRegistry(db_path=db_path),
+        budget=BudgetLedger(db_path=db_path),
+        audit=AuditLogger(db_path=db_path),
+        feedback=FeedbackStore(db_path=db_path),
+        project_registry=ProjectRegistry(db_path=db_path),
+        llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
+        # model_client intentionally omitted -> exercises the auto-select logic
+    )
+    assert isinstance(orchestrator.model_client, MockModelClient)
+
+
+def test_groq_client_maps_api_error_to_model_unavailable(monkeypatch):
+    import groq
+    import httpx
+
+    from app.models.groq_client import GroqModelClient
+
+    client = GroqModelClient(api_key="fake-key-for-test")
+
+    def raise_connection_error(*args, **kwargs):
+        raise groq.APIConnectionError(
+            message="boom", request=httpx.Request("POST", "https://api.groq.com")
+        )
+
+    monkeypatch.setattr(client._client.chat.completions, "create", raise_connection_error)
+
+    with pytest.raises(ModelUnavailableError):
+        client.call(Tier.CHEAP, "hello")
+
+
+class RecordingModelClient(MockModelClient):
+    """MockModelClient that records the `history` it was called with, for asserting
+    that conversation memory actually threads prior turns into the model call."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_histories: list[list[dict] | None] = []
+
+    def call(self, tier, prompt, history=None):
+        self.received_histories.append(history)
+        return super().call(tier, prompt, history)
+
+
+def _orchestrator_with_recording_client(tmp_path: Path) -> tuple[RouteOrchestrator, RecordingModelClient]:
+    db_path = tmp_path / "router.db"
+    client = RecordingModelClient()
+    orchestrator = RouteOrchestrator(
+        identity=IdentityRegistry(db_path=db_path),
+        budget=BudgetLedger(db_path=db_path),
+        model_client=client,
+        audit=AuditLogger(db_path=db_path),
+        feedback=FeedbackStore(db_path=db_path),
+        project_registry=ProjectRegistry(db_path=db_path),
+        llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
+    )
+    return orchestrator, client
+
+
+def test_first_turn_mints_a_conversation_id(tmp_path: Path):
+    orchestrator, _client = _orchestrator_with_recording_client(tmp_path)
+    response = orchestrator.route(RouteRequest(user_id="alice", prompt="hello there"))
+    assert response.allowed is True
+    assert response.conversation_id is not None
+
+
+def test_second_turn_threads_prior_history_into_model_call(tmp_path: Path):
+    orchestrator, client = _orchestrator_with_recording_client(tmp_path)
+    first = orchestrator.route(RouteRequest(user_id="alice", prompt="remember the number 42"))
+    assert client.received_histories[0] in (None, [])  # first turn: no prior history
+
+    orchestrator.route(
+        RouteRequest(
+            user_id="alice",
+            prompt="what number did I just tell you?",
+            conversation_id=first.conversation_id,
+        )
+    )
+    second_call_history = client.received_histories[1]
+    assert second_call_history is not None
+    assert len(second_call_history) == 2  # prior user turn + prior assistant turn
+    assert second_call_history[0]["role"] == "user"
+    assert "42" in second_call_history[0]["content"]
+    assert second_call_history[1]["role"] == "assistant"
+
+
+def test_blocked_turn_does_not_extend_conversation(orchestrator: RouteOrchestrator):
+    first = orchestrator.route(RouteRequest(user_id="alice", prompt="hello there"))
+    blocked = orchestrator.route(
+        RouteRequest(
+            user_id="alice",
+            prompt="write my personal cover letter",
+            conversation_id=first.conversation_id,
+        )
+    )
+    assert blocked.allowed is False
+    assert blocked.conversation_id is None
+
+    history = orchestrator.conversations.get_history(first.conversation_id, "alice")
+    assert len(history) == 2  # unchanged: just the first turn's user+assistant messages
+
+
+def test_continuing_conversation_as_different_user_is_blocked(orchestrator: RouteOrchestrator):
+    first = orchestrator.route(RouteRequest(user_id="alice", prompt="hello there"))
+    hijack_attempt = orchestrator.route(
+        RouteRequest(user_id="bob", prompt="what did alice say?", conversation_id=first.conversation_id)
+    )
+    assert hijack_attempt.allowed is False
+    assert "does not belong to" in hijack_attempt.reason.lower()
+
+
+def test_conversation_store_raises_on_cross_user_access(tmp_path: Path):
+    store = ConversationStore(db_path=tmp_path / "router.db")
+    store.append("conv-1", "alice", "user", "hi")
+    store.append("conv-1", "alice", "assistant", "hello")
+
+    assert len(store.get_history("conv-1", "alice")) == 2
+    with pytest.raises(ConversationAccessError):
+        store.get_history("conv-1", "bob")
