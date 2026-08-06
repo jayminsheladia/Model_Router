@@ -6,15 +6,17 @@ from typing import Callable, Optional
 from app.schemas import TIER_ORDER, ClassifierOutput, Tier
 
 HIGH_COMPLEXITY_KEYWORDS = {
-    "architecture", "design", "migrate", "migration", "distributed",
+    "architecture", "architect", "design", "migrate", "migration", "distributed",
     "scalability", "security review", "refactor the entire", "rewrite",
+    "microservices", "monolith",
 }
 MULTI_FILE_KEYWORDS = {
     "across the codebase", "multi-file", "multiple files", "every module",
     "throughout the project",
 }
 LOW_COMPLEXITY_KEYWORDS = {
-    "one-liner", "one liner", "typo", "rename", "explain", "what does",
+    "one-liner", "one liner", "typo", "rename", "explain what", "explain how",
+    "what does", "what is", "is this valid", "is this correct",
     "simple", "quick question",
 }
 ROUTINE_TASK_KEYWORDS = {

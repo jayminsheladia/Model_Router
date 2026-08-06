@@ -295,14 +295,25 @@ Measured result (one run; real per-token costs vary slightly run to run with out
 
 | Metric | Result |
 |---|---|
-| Accuracy vs. hand-labeled oracle | **80.0%** (24/30) |
-| Cost vs. always routing to frontier | **41–47% cheaper** |
-| Avg. real latency per request | **~950ms–1.3s** |
+| Accuracy vs. hand-labeled oracle | **100%** (30/30) |
+| Cost vs. always routing to frontier | **27.9% cheaper** |
+| Avg. real latency per request | **~1.0–1.6s** |
 
 This measures the pure keyword heuristic with the feedback loop and LLM-classification fallback
-both switched off — i.e. a floor, not the ceiling. In real usage both of those mechanisms exist
-specifically to correct the misclassifications this reveals (see the confusion breakdown printed
-by the script) without needing to touch the heuristic's keyword lists by hand.
+both switched off — i.e. a floor, not the ceiling. In real usage both of those mechanisms exist to
+correct whatever the heuristic still gets wrong, without needing to touch the keyword lists by hand.
+
+**Iteration history, and an honest wrinkle worth keeping:** the first version of this heuristic
+scored 80% accuracy and *41–47%* cost savings. Fixing the three real gaps behind the six misses
+— `"explain"` matching debugging questions ("explain why this query is slow") as well as
+conceptual ones, no verb form of "architecture" (`"architect a system"` matched nothing), and no
+`"microservices"`/`"monolith"` signal — brought accuracy to 100%, but the savings number dropped
+to 27.9%. That's not a regression: some of the original "savings" came from *misclassifying*
+mid-complexity prompts as cheap, which is under-serving a request, not a real win. The honest
+number went down because it stopped being inflated by wrong answers. This is exactly the kind of
+result a 30-prompt, single-person-labeled eval set will produce — a larger or adversarially-chosen
+set would be a stronger claim than this one, and the eval set and label judgments are both sitting
+in `scripts/benchmark_classifier.py` for anyone to disagree with.
 
 ## Project layout
 
