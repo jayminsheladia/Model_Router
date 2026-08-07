@@ -92,6 +92,11 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
+function tierBadge(tier) {
+  if (!tier) return "";
+  return `<span class="tier-text tier-${tier}">${tier}</span>`;
+}
+
 async function fetchJSON(url, options) {
   const res = await fetch(url, options);
   const body = await res.json().catch(() => ({}));
@@ -108,7 +113,10 @@ function budgetBarClass(budget) {
   return "";
 }
 
-function renderBudgets(users) {
+function renderBudgets(users, previousUsers) {
+  const previousSpend = {};
+  for (const u of previousUsers || []) previousSpend[u.user_id] = u.budget.spent_usd;
+
   budgetsList.innerHTML = "";
   if (users.length === 0) {
     budgetsList.innerHTML = '<p class="empty">No users seeded.</p>';
@@ -120,11 +128,13 @@ function renderBudgets(users) {
     // ~0.0002%), which renders as a 0px bar even though real money was spent. Give any nonzero
     // spend a visible sliver so the bar doesn't look frozen at zero.
     const visualPct = user.budget.spent_usd > 0 ? Math.max(rawPct, 1) : 0;
+    const changed = previousSpend[user.user_id] !== undefined
+      && previousSpend[user.user_id] !== user.budget.spent_usd;
     const item = document.createElement("div");
-    item.className = "budget-item";
+    item.className = changed ? "budget-item just-updated" : "budget-item";
     item.innerHTML = `
       <div class="budget-item-head">
-        <span><strong>${user.user_id}</strong> <span class="muted">(${user.team}, max ${user.max_tier})</span></span>
+        <span><strong>${user.user_id}</strong> <span class="muted">(${user.team}, max</span> ${tierBadge(user.max_tier)}<span class="muted">)</span></span>
         <span class="muted">$${formatCost(user.budget.spent_usd)} / $${user.budget.limit_usd.toFixed(2)}</span>
       </div>
       <div class="budget-bar"><div class="budget-bar-fill ${budgetBarClass(user.budget)}" style="width:${visualPct}%"></div></div>
@@ -151,9 +161,10 @@ function populateUserSelect(users) {
 }
 
 async function loadUsers() {
+  const previousUsers = usersCache;
   usersCache = await fetchJSON("/users");
   populateUserSelect(usersCache);
-  renderBudgets(usersCache);
+  renderBudgets(usersCache, previousUsers);
 }
 
 async function loadProjects() {
@@ -175,7 +186,7 @@ function renderResult(response) {
   const badgeText = response.allowed ? "Allowed" : "Blocked";
 
   const tierRow = response.allowed
-    ? `<div class="result-row"><span class="label">Routed to:</span><strong>${response.final_tier}</strong> tier (${response.model_name})</div>`
+    ? `<div class="result-row"><span class="label">Routed to:</span>${tierBadge(response.final_tier)} <span class="label">(${response.model_name})</span></div>`
     : "";
 
   const costRow = response.allowed
@@ -237,6 +248,7 @@ routeForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const submitBtn = routeForm.querySelector("button[type=submit]");
   submitBtn.disabled = true;
+  submitBtn.classList.add("loading");
   resultEl.classList.add("hidden");
   const continuePrevious = conversation.id && continueCheckbox.checked;
   const promptSent = promptInput.value;
@@ -272,6 +284,7 @@ routeForm.addEventListener("submit", async (event) => {
     resultEl.innerHTML = `<div class="result-row"><span class="badge blocked">Error</span> ${err.message}</div>`;
   } finally {
     submitBtn.disabled = false;
+    submitBtn.classList.remove("loading");
   }
 });
 
@@ -287,7 +300,7 @@ function renderAudit(entries) {
     const outcome = entry.allowed
       ? '<span class="badge allowed">Allowed</span>'
       : '<span class="badge blocked">Blocked</span>';
-    const tierPath = `${entry.classifier.complexity} → ${entry.final_tier || "—"}`;
+    const tierPath = `${entry.classifier.complexity} &rarr; ${entry.final_tier ? tierBadge(entry.final_tier) : "—"}`;
     tr.innerHTML = `
       <td>${time}</td>
       <td>${entry.user_id}</td>
