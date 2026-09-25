@@ -15,7 +15,8 @@ All six components from the original design are implemented:
 2. **Identity & context** (`app/identity.py`) — users, teams, budgets, project-level access
 3. **Policy engine** (`app/policy.py`) — off-policy block, budget block, project authorization,
    tier caps, and a Quality/Cost/Balanced routing-mode dial
-4. **Budget ledger** (`app/budget.py`) — per-user spend tracking with soft/hard limits
+4. **Budget ledger** (`app/budget.py`) — per-user monthly spend with soft/hard limits, using
+   reservations so concurrent requests can't collectively overshoot a cap
 5. **Audit trail** (`app/audit.py`) — full decision trace for every request
 6. **Feedback loop** (`app/feedback.py`) — escalate/downgrade signals bias future classifier suggestions
 
@@ -40,7 +41,7 @@ POST /route {user_id, prompt, project?, routing_mode?, conversation_id?}
                              conversation belongs to someone else -- see "Conversation memory" below)
   -> classifier              (heuristic complexity scorer, biased by past /feedback signals;
                               genuinely ambiguous prompts get a real Claude Haiku call, see below)
-  -> budget check              (spent vs. monthly limit -> soft/hard limit flags)
+  -> budget check              (this month's spend vs. monthly limit -> soft/hard limit flags)
   -> policy engine                (off-policy? hard limit? user allowed on this project? project itself
                                    restricted to other users? tier cap/override? cost/quality routing
                                    mode adjustment? soft-limit downgrade?)
@@ -132,9 +133,23 @@ Groq-hosted models with real per-token pricing:
 
 | Tier | Model | Input / Output $ per 1M tokens |
 |---|---|---|
-| cheap | `llama-3.1-8b-instant` | $0.05 / $0.08 |
-| mid | `openai/gpt-oss-20b` | $0.075 / $0.30 |
-| frontier | `openai/gpt-oss-120b` | $0.15 / $0.60 (Groq's own flagship) |
+| cheap | `openai/gpt-oss-20b` | $0.075 / $0.30 |
+| mid | `openai/gpt-oss-120b` | $0.15 / $0.60 |
+| frontier | `qwen/qwen3.8-27b` | $0.80 / $4.00 (reasoning model) |
+
+> **Why these three, and a caveat.** The ladder originally ran
+> `llama-3.1-8b-instant` → `gpt-oss-20b` → `gpt-oss-120b`. Groq has since moved the Llama
+> models off self-serve, so `llama-3.1-8b-instant` returns a 404 and the cheap tier had to be
+> rebuilt from what's actually served. The current ladder is strictly increasing in price
+> (13x from cheap to frontier on output), which is what the routing argument needs. The
+> caveat: `qwen/qwen3.8-27b` is a *preview* model on Groq, labelled for evaluation rather
+> than production — it's the only served model meaningfully more capable and more expensive
+> than `gpt-oss-120b`, so it fills the frontier slot, but a production deployment would want
+> a production-tier frontier model.
+>
+> `GroqModelClient.verify_models()` checks every configured model ID against the live model
+> list, so a retirement like the Llama one fails loudly at startup instead of 404-ing partway
+> through a benchmark run. Both benchmark scripts call it before doing any work.
 
 ```bash
 cp .env.example .env
@@ -195,6 +210,33 @@ into the model call as real chat history.
   cross-user data leak sitting in its one stateful feature.
 - Blocked turns are never appended to conversation history — there's no real completion to
   represent, so nothing gets threaded into the *next* turn's model call.
+- **History is capped to the last 20 messages** (`MAX_HISTORY_MESSAGES`). Every turn re-sends
+  the whole history as prompt tokens, so an uncapped conversation makes per-turn cost climb
+  with conversation length — which would make the router's one stateful feature the most
+  expensive thing it serves. The window makes per-turn cost flat instead of growing.
+
+### Budget enforcement
+
+Two things here are easy to get wrong, and the first version got both wrong.
+
+**The month actually means a month.** Spend is summed over the current calendar month only
+(`created_at >= month_start`). Summing the whole table instead turns `monthly_budget_usd` into a
+lifetime cap — a user who hits it is blocked permanently, and the limit never resets — while the
+block message still says "monthly budget", so the bug reads as correct behaviour.
+
+**Concurrent requests reserve before they spend.** A check-then-spend ledger is a race: N
+simultaneous requests all read the same pre-spend total, all pass the limit check, and together
+blow past the cap. Instead, an allowed request calls `reserve()`, which takes the SQLite write
+lock (`BEGIN IMMEDIATE`), re-checks the limit, and writes a *pending* row holding the call's
+worst-case cost. After the model returns, `settle()` rewrites that row with the real cost;
+`release()` drops it if every tier failed. In-flight spend is therefore visible to every other
+request. With 8 concurrent requests against a $1.00 cap each reserving $1.00, the old code
+granted all 8 and committed $8.00; the reservation grants exactly one
+(`test_concurrent_requests_cannot_overshoot_the_hard_limit`).
+
+Reservations are worst-case by construction — output is billed at the full completion-token cap,
+since the real length isn't known until the call returns. Over-reserving is safe because the
+reservation settles down to the true cost; under-reserving would reopen the hole.
 
 The dashboard surfaces this as a "Continue this conversation" checkbox (checked by default once a
 conversation exists) and renders the growing thread above the latest turn's full detail.
@@ -296,8 +338,14 @@ Measured result (one run; real per-token costs vary slightly run to run with out
 | Metric | Result |
 |---|---|
 | Accuracy vs. hand-labeled oracle | **100%** (30/30) |
-| Cost vs. always routing to frontier | **27.9% cheaper** |
-| Avg. real latency per request | **~1.0–1.6s** |
+| Cost vs. always routing to frontier | **28.1% cheaper** |
+| Avg. real latency per request | **~10s** |
+
+Latency is dominated by the frontier tier being a *reasoning* model (`qwen/qwen3.8-27b`), which
+spends tokens thinking before it answers. That is a real cost of the current tier ladder and not
+a measurement artifact: the earlier ladder, whose frontier was `gpt-oss-120b`, averaged ~1–1.6s.
+Routing away from frontier therefore buys latency as well as money — a dimension this benchmark
+records but doesn't yet score.
 
 This measures the pure keyword heuristic with the feedback loop and LLM-classification fallback
 both switched off — i.e. a floor, not the ceiling. In real usage both of those mechanisms exist to
@@ -315,6 +363,41 @@ result a 30-prompt, single-person-labeled eval set will produce — a larger or 
 set would be a stronger claim than this one, and the eval set and label judgments are both sitting
 in `scripts/benchmark_classifier.py` for anyone to disagree with.
 
+### Does routing down actually cost quality?
+
+The benchmark above has a blind spot worth being explicit about: it scores the classifier against
+**tier labels I wrote myself**. That answers "did the heuristic agree with me?" — not "was the
+cheaper answer good enough?" A router that sent every prompt to the cheapest model would look
+terrible on that metric and might still be fine in practice; one that agreed with my labels
+perfectly could still be quietly under-serving every request. Cost savings without a quality
+denominator is half a number.
+
+`scripts/benchmark_quality.py` supplies the other half. For each prompt it calls the tier the
+router chose *and* the frontier tier, then shows both answers to a judge model in randomized
+order and asks which better serves the request:
+
+```bash
+python scripts/benchmark_quality.py
+```
+
+| Metric | Result |
+|---|---|
+| Quality held vs. always-frontier | **93.3%** (28/30) |
+| Cost vs. always routing to frontier | **33.2% cheaper** |
+
+Judge verdicts: 13 ties, 5 wins for the *cheaper* answer, 10 already routed to frontier, and
+2 losses. Both losses were `mid`-tier prompts — "update the database config for the staging
+environment" and "add input validation to this form handler" — where the frontier model's extra
+depth genuinely helped.
+
+Caveats, stated plainly: it's one judge, not a panel, and the judge is the same model family
+that produces the frontier answers, which is a real bias risk even with the comparison blinded.
+The order of the two answers is randomized per prompt because judge models systematically favour
+whichever they read first. 30 prompts is small. The honest version of the headline is
+*"33.2% cheaper at 93.3% quality retention (n=30, single judge, pairwise)"* — and the savings
+figure differs from the 28.1% above because output lengths, and therefore real token costs, vary
+between runs.
+
 ## Project layout
 
 ```
@@ -327,7 +410,7 @@ app/
   projects.py            Project registry (who's authorized per project), seeded from data/projects.json
   classifier.py             Heuristic complexity + off-policy classifier, feedback-biasable
   llm_classifier.py           Real Claude Haiku fallback for ambiguous prompts; no-ops without a key
-  budget.py                     Per-user spend ledger (SQLite) with soft/hard limits
+  budget.py                     Per-user monthly spend ledger (SQLite); reserve -> settle
   policy.py                       Policy engine: off-policy > hard-limit > per-user project allowlist >
                                    per-project authorization > tier cap/override > routing-mode
                                    adjustment > soft-limit downgrade
@@ -344,6 +427,7 @@ data/
   router.db                                     Created at runtime (gitignored)
 scripts/
   benchmark_classifier.py                         Real-Groq-call benchmark vs. a hand-labeled oracle set
+  benchmark_quality.py                            Judge-scored: does routing down actually cost quality?
 .env.example                                      Copy to .env to enable real model serving + classification
 ```
 

@@ -71,6 +71,10 @@ def main():
     if not client.enabled:
         raise SystemExit("GROQ_API_KEY not set -- copy .env.example to .env and add a key.")
 
+    missing = client.verify_models()
+    if missing:
+        raise SystemExit(f"Configured models no longer served by Groq: {', '.join(missing)}")
+
     correct = 0
     predicted_cost_total = 0.0
     frontier_cost_total = 0.0
