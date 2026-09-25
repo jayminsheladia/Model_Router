@@ -5,6 +5,8 @@ from pathlib import Path
 
 from app.db import DEFAULT_DB_PATH, now_iso
 
+MAX_HISTORY_MESSAGES = 20
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversation_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -31,17 +33,29 @@ class ConversationStore:
             conn.execute(SCHEMA)
 
     def get_history(self, conversation_id: str, user_id: str) -> list[dict]:
+        """Most recent turns only.
+
+        Every turn re-sends this history as prompt tokens, so an uncapped
+        conversation makes per-turn cost grow with conversation length -- the
+        window keeps a long chat from quietly becoming the most expensive thing
+        the router serves.
+        """
         with sqlite3.connect(self._db_path) as conn:
-            rows = conn.execute(
-                "SELECT role, content, user_id FROM conversation_messages "
-                "WHERE conversation_id = ? ORDER BY id ASC",
+            owner = conn.execute(
+                "SELECT user_id FROM conversation_messages "
+                "WHERE conversation_id = ? ORDER BY id ASC LIMIT 1",
                 (conversation_id,),
+            ).fetchone()
+            if owner is None:
+                return []
+            if owner[0] != user_id:
+                raise ConversationAccessError(conversation_id)
+            rows = conn.execute(
+                "SELECT role, content FROM conversation_messages "
+                "WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
+                (conversation_id, MAX_HISTORY_MESSAGES),
             ).fetchall()
-        if not rows:
-            return []
-        if rows[0][2] != user_id:
-            raise ConversationAccessError(conversation_id)
-        return [{"role": role, "content": content} for role, content, _owner in rows]
+        return [{"role": role, "content": content} for role, content in reversed(rows)]
 
     def append(self, conversation_id: str, user_id: str, role: str, content: str) -> None:
         with sqlite3.connect(self._db_path) as conn:

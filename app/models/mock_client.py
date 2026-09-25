@@ -56,3 +56,10 @@ class MockModelClient:
         turn_note = f", turn {len(history) // 2 + 1}" if history else ""
         output_text = f"[{spec.model_name}] mock response ({tokens} tokens{turn_note})"
         return output_text, tokens, cost_usd, latency_ms, spec.model_name
+
+    def estimate_max_cost(
+        self, tier: Tier, prompt: str, history: Optional[list[dict]] = None
+    ) -> float:
+        history_chars = sum(len(m.get("content", "")) for m in (history or []))
+        tokens = max(1, int((len(prompt) + history_chars) * TOKENS_PER_CHAR))
+        return (tokens / 1000) * TIER_SPECS[tier].cost_per_1k_tokens

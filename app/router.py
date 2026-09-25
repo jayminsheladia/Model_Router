@@ -103,23 +103,52 @@ class RouteOrchestrator:
             cost_usd = 0.0
             latency_ms = 0.0
         else:
-            (
-                final_tier,
-                output_text,
-                cost_usd,
-                latency_ms,
-                model_name,
-                failover_note,
-            ) = self._call_with_failover(decision.final_tier, request.prompt, history)
-            reason += failover_note
-            if final_tier is None:
-                decision = decision.model_copy(update={"allowed": False})
-            else:
-                self.budget.record(user, cost_usd)
+            max_cost = self.model_client.estimate_max_cost(
+                decision.final_tier, request.prompt, history
+            )
+            reservation_id = self.budget.reserve(user, max_cost)
+            if reservation_id is None:
+                # Another in-flight request consumed the remaining budget between
+                # the check above and here.
+                decision = decision.model_copy(
+                    update={
+                        "allowed": False,
+                        "reason": (
+                            f"Blocked: {request.user_id} has exhausted their monthly budget "
+                            f"(concurrent request consumed the remainder)."
+                        ),
+                    }
+                )
+                reason = decision.reason
+                final_tier = None
+                model_name = None
+                output_text = None
+                cost_usd = 0.0
+                latency_ms = 0.0
                 budget_state = self.budget.check(user)
-                conversation_id = request.conversation_id or str(uuid.uuid4())
-                self.conversations.append(conversation_id, request.user_id, "user", request.prompt)
-                self.conversations.append(conversation_id, request.user_id, "assistant", output_text)
+            else:
+                (
+                    final_tier,
+                    output_text,
+                    cost_usd,
+                    latency_ms,
+                    model_name,
+                    failover_note,
+                ) = self._call_with_failover(decision.final_tier, request.prompt, history)
+                reason += failover_note
+                if final_tier is None:
+                    self.budget.release(reservation_id)
+                    decision = decision.model_copy(update={"allowed": False})
+                else:
+                    self.budget.settle(reservation_id, cost_usd)
+                    budget_state = self.budget.check(user)
+                    conversation_id = request.conversation_id or str(uuid.uuid4())
+                    self.conversations.append(
+                        conversation_id, request.user_id, "user", request.prompt
+                    )
+                    self.conversations.append(
+                        conversation_id, request.user_id, "assistant", output_text
+                    )
 
         audit_id = self.audit.record(
             {

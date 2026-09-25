@@ -1,10 +1,12 @@
+import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
 from app.audit import AuditLogger
 from app.budget import BudgetLedger
-from app.conversations import ConversationAccessError, ConversationStore
+from app.conversations import MAX_HISTORY_MESSAGES, ConversationAccessError, ConversationStore
 from app.feedback import FeedbackStore
 from app.identity import IdentityRegistry
 from app.llm_classifier import LLMClassifier
@@ -382,3 +384,129 @@ def test_conversation_store_raises_on_cross_user_access(tmp_path: Path):
     assert len(store.get_history("conv-1", "alice")) == 2
     with pytest.raises(ConversationAccessError):
         store.get_history("conv-1", "bob")
+
+
+# --- Budget: monthly window, reservations, concurrency ---
+
+
+def test_budget_only_counts_the_current_month(tmp_path: Path):
+    """Spend from a previous month must not count against this month's limit."""
+    db_path = tmp_path / "router.db"
+    ledger = BudgetLedger(db_path=db_path)
+    user = IdentityRegistry(db_path=db_path).get_user("bob")  # $1.00 limit
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO usage (user_id, cost_usd, created_at, pending) VALUES (?, ?, ?, 0)",
+            ("bob", 5.00, "2020-01-15T00:00:00+00:00"),
+        )
+
+    state = ledger.check(user)
+    assert state.spent_usd == 0.0
+    assert state.over_hard_limit is False
+
+
+def test_budget_counts_spend_inside_the_current_month(tmp_path: Path):
+    db_path = tmp_path / "router.db"
+    ledger = BudgetLedger(db_path=db_path)
+    user = IdentityRegistry(db_path=db_path).get_user("bob")
+
+    ledger.record(user, 0.90)
+    state = ledger.check(user)
+    assert state.spent_usd == pytest.approx(0.90)
+    assert state.over_soft_limit is True
+    assert state.over_hard_limit is False
+
+
+def test_reservation_is_visible_to_a_concurrent_request(tmp_path: Path):
+    """An in-flight reservation counts against the budget before it settles."""
+    db_path = tmp_path / "router.db"
+    ledger = BudgetLedger(db_path=db_path)
+    user = IdentityRegistry(db_path=db_path).get_user("bob")  # $1.00 limit
+
+    first = ledger.reserve(user, 1.50)
+    assert first is not None
+    # Second request sees the first one's worst-case spend and is refused.
+    assert ledger.reserve(user, 1.50) is None
+
+    # Settling down to the real cost frees the headroom again.
+    ledger.settle(first, 0.10)
+    assert ledger.reserve(user, 0.10) is not None
+
+
+def test_released_reservation_frees_budget(tmp_path: Path):
+    db_path = tmp_path / "router.db"
+    ledger = BudgetLedger(db_path=db_path)
+    user = IdentityRegistry(db_path=db_path).get_user("bob")
+
+    reservation = ledger.reserve(user, 1.50)
+    ledger.release(reservation)
+    assert ledger.check(user).spent_usd == 0.0
+
+
+def test_concurrent_requests_cannot_overshoot_the_hard_limit(tmp_path: Path):
+    """The bug this guards: N threads all read the same pre-spend total,
+    all pass the limit check, and together blow past the cap."""
+    db_path = tmp_path / "router.db"
+    ledger = BudgetLedger(db_path=db_path)
+    user = IdentityRegistry(db_path=db_path).get_user("bob")  # $1.00 limit
+
+    granted = []
+    barrier = threading.Barrier(8)
+
+    def attempt():
+        barrier.wait()
+        if ledger.reserve(user, 1.00) is not None:
+            granted.append(1)
+
+    threads = [threading.Thread(target=attempt) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(granted) == 1, f"{len(granted)} requests passed a $1.00 cap reserving $1.00 each"
+
+
+# --- Conversation history is bounded ---
+
+
+def test_history_is_capped_to_the_most_recent_turns(tmp_path: Path):
+    store = ConversationStore(db_path=tmp_path / "router.db")
+    for i in range(40):
+        store.append("conv-1", "alice", "user", f"message {i}")
+
+    history = store.get_history("conv-1", "alice")
+    assert len(history) == MAX_HISTORY_MESSAGES
+    # Keeps the newest turns, not the oldest.
+    assert history[-1]["content"] == "message 39"
+
+
+def test_long_conversation_does_not_grow_cost_without_bound(tmp_path: Path):
+    """Per-turn prompt cost must plateau once history hits the window."""
+    db_path = tmp_path / "router.db"
+    orchestrator = RouteOrchestrator(
+        identity=IdentityRegistry(db_path=db_path),
+        budget=BudgetLedger(db_path=db_path),
+        model_client=MockModelClient(),
+        audit=AuditLogger(db_path=db_path),
+        feedback=FeedbackStore(db_path=db_path),
+        project_registry=ProjectRegistry(db_path=db_path),
+        llm_classifier=LLMClassifier(api_key=None),
+        conversations=ConversationStore(db_path=db_path),
+    )
+
+    conversation_id = None
+    costs = []
+    for i in range(24):
+        response = orchestrator.route(
+            RouteRequest(
+                user_id="alice",
+                prompt="refactor this function to be async",
+                conversation_id=conversation_id,
+            )
+        )
+        conversation_id = response.conversation_id
+        costs.append(response.cost_usd)
+
+    assert costs[-1] == pytest.approx(costs[-2])
